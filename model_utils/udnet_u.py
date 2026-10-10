@@ -114,6 +114,97 @@ class UDnetG(nn.Module):
         return self.decoder(x, x, training=False)
 
 
+# ----------------------------------------------------------------------------
+# Learned physics prior, adapted from Cheng et al., "Transmission map and background
+# light guided enhancement of unpaired underwater image", Neurocomputing 621 (2025).
+# Their UIIE-Subnet (t from the input, B by Gaussian blur) and UDE-Subnet (t', B'
+# from the enhanced image) are used as training-only critics on UDnet's output,
+# without their CycleGAN (no reverse generator, no second discriminator).
+# ----------------------------------------------------------------------------
+def gaussian_blur(x, sigma):
+    """Separable Gaussian blur with replicate padding (works for any image size)."""
+    k = int(2 * round(3 * sigma) + 1)
+    r = torch.arange(k, device=x.device, dtype=x.dtype) - k // 2
+    g = torch.exp(-r ** 2 / (2 * sigma ** 2))
+    g = g / g.sum()
+    C, p = x.shape[1], k // 2
+    x = F.conv2d(F.pad(x, (p, p, 0, 0), mode="replicate"), g.view(1, 1, 1, k).repeat(C, 1, 1, 1), groups=C)
+    return F.conv2d(F.pad(x, (0, 0, p, p), mode="replicate"), g.view(1, 1, k, 1).repeat(C, 1, 1, 1), groups=C)
+
+
+def _conv(cin, cout, k, s=1):
+    return nn.Sequential(nn.Conv2d(cin, cout, k, s, k // 2, padding_mode="reflect"),
+                         nn.InstanceNorm2d(cout), nn.ReLU(True))
+
+
+def _deconv(cin, cout):
+    return nn.Sequential(nn.ConvTranspose2d(cin, cout, 3, 2, 1, output_padding=1),
+                         nn.InstanceNorm2d(cout), nn.ReLU(True))
+
+
+class _Res(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.body = nn.Sequential(_conv(ch, ch, 3), nn.Conv2d(ch, ch, 3, 1, 1, padding_mode="reflect"),
+                                  nn.InstanceNorm2d(ch))
+
+    def forward(self, x):
+        return x + self.body(x)
+
+
+class TransmissionNet(nn.Module):
+    """UIIE-Subnet t branch: t (3 channels, sigmoid) from the input I and its blurred background B."""
+    def __init__(self, ch=32):
+        super().__init__()
+        self.net = nn.Sequential(_conv(6, ch, 7), _conv(ch, 2 * ch, 3, 2), _conv(2 * ch, 4 * ch, 3, 2),
+                                 _deconv(4 * ch, 2 * ch), _deconv(2 * ch, ch), nn.Conv2d(ch, 3, 7, 1, 3), nn.Sigmoid())
+
+    def forward(self, I, B):
+        return self.net(torch.cat([I, B], 1))
+
+
+class DegradationNet(nn.Module):
+    """UDE-Subnet: t' and B' (3 channels each, sigmoid) predicted from the enhanced image alone."""
+    def __init__(self, ch=32):
+        super().__init__()
+        self.enc = nn.Sequential(_conv(3, ch, 7), _conv(ch, 2 * ch, 3, 2), _conv(2 * ch, 4 * ch, 3, 2),
+                                 _Res(4 * ch), _Res(4 * ch), _Res(4 * ch))
+        self.dec_t = nn.Sequential(_deconv(4 * ch, 2 * ch), _deconv(2 * ch, ch), nn.Conv2d(ch, 3, 7, 1, 3), nn.Sigmoid())
+        self.dec_B = nn.Sequential(_deconv(4 * ch, 2 * ch), _deconv(2 * ch, ch), nn.Conv2d(ch, 3, 7, 1, 3), nn.Sigmoid())
+
+    def forward(self, J):
+        f = self.enc(J)
+        return self.dec_t(f), self.dec_B(f)
+
+
+class LearnedPhysics(nn.Module):
+    """Physics prior of Cheng et al. (2025) as a loss on the enhanced image J (training only).
+
+    enh : I = J*t  + B*(1-t)    t from TransmissionNet(I, B), B = GaussianBlur(I)
+    deg : I = J*t' + B'*(1-t')  t', B' from DegradationNet(J)   (physics-shaped half cycle)
+    t, B: ||t - t'||^2, ||B - B'||^2                             (physical map consistency)
+    The paper defines J by the inversion; here J comes from UDnet, so the enh term is a
+    soft version of it. The paper weights cycle : t : B as 10 : 5 : 5, hence w_t = w_B = 0.5.
+    The paper does not give the blur size or layer widths; sigma_frac and ch are our choice.
+    """
+    def __init__(self, sigma_frac=0.1, ch=32, w_enh=1.0, w_deg=1.0, w_t=0.5, w_B=0.5):
+        super().__init__()
+        self.tnet, self.ude = TransmissionNet(ch), DegradationNet(ch)
+        self.sigma_frac, self.w = sigma_frac, dict(enh=w_enh, deg=w_deg, t=w_t, B=w_B)
+
+    def forward(self, J, I):
+        with torch.no_grad():
+            B = gaussian_blur(I, self.sigma_frac * min(I.shape[-2:]))
+        t = self.tnet(I, B)
+        t2, B2 = self.ude(J)
+        terms = {"enh": (J * t + B * (1 - t) - I).abs().mean(),
+                 "deg": (J * t2 + B2 * (1 - t2) - I).abs().mean(),
+                 "t": ((t - t2) ** 2).mean(),
+                 "B": ((B - B2) ** 2).mean()}
+        total = sum(self.w[k] * v for k, v in terms.items())
+        return total, terms
+
+
 def load_repo_weights(G, path):
     """Initialise UDnetG from a Train.py / author checkpoint; report what did not load."""
     sd = torch.load(path, map_location="cpu")

@@ -6,6 +6,8 @@ Stage 2: unpaired -- after --warmup_iters the posterior sees a clean image inste
          of the pseudo-label, and L_e fades out over --le_anneal iterations.
 
 Every term can be switched off (lam_* = 0, --lock none) for ablations.
+The physical loss uses either the demo's underwater DCP (--phys_mode dcp) or the
+learned physics prior of Cheng et al. 2025 (--phys_mode learned, training-only nets).
 Training length is a fixed number of iterations so runs with 200/400/800 images
 take the same number of steps. Resumes automatically from save_folder/last.pth.
 """
@@ -24,8 +26,8 @@ from PIL import Image, ImageOps
 from model_utils.data import get_training_set
 from model_utils.dataset import is_image_file
 from model_utils.UDnet import PerceptionLoss
-from model_utils.udnet_u import (UDnetG, PatchDiscriminator, PhysicalLoss, underwater_dcp, apply_phase_lock,
-                                 lsgan_d_loss, lsgan_g_loss, load_repo_weights)
+from model_utils.udnet_u import (UDnetG, PatchDiscriminator, PhysicalLoss, LearnedPhysics, underwater_dcp,
+                                 apply_phase_lock, lsgan_d_loss, lsgan_g_loss, load_repo_weights)
 
 
 def str2bool(v):
@@ -51,6 +53,12 @@ parser.add_argument('--beta_kl', type=float, default=1.0, help='weight of KL (L_
 parser.add_argument('--lam_adv', type=float, default=0.01, help='weight of adversarial loss; 0 = no GAN')
 parser.add_argument('--adv_warmup', type=int, default=2000, help='iterations to ramp lam_adv from 0')
 parser.add_argument('--lam_phys', type=float, default=0.0, help='weight of physical reconstruction loss')
+parser.add_argument('--phys_mode', type=str, default='dcp', choices=['dcp', 'learned'],
+                    help='dcp: t, B from underwater DCP (demo) | learned: physics prior of Cheng et al. 2025')
+parser.add_argument('--gb_sigma', type=float, default=0.1, help='learned: Gaussian blur sigma for B, as a fraction of image size')
+parser.add_argument('--phys_ch', type=int, default=32, help='learned: width of the training-only physics networks')
+parser.add_argument('--phys_w', type=float, nargs=4, default=[1.0, 1.0, 0.5, 0.5], metavar=('ENH', 'DEG', 'T', 'B'),
+                    help='learned: weights of the enh / deg / t-consistency / B-consistency terms')
 parser.add_argument('--lock', type=str, default='none', choices=['none', 'full', 'low', 'high'])
 parser.add_argument('--lock_radius', type=float, default=0.5)
 parser.add_argument('--warmup_iters', type=int, default=0, help='stage 2: iterations trained like stage 1 first')
@@ -132,9 +140,13 @@ if __name__ == '__main__':
     G = UDnetG().to(device)
     D = PatchDiscriminator().to(device)
     P = PhysicalLoss().to(device)
+    LP = None
+    if opt.lam_phys > 0 and opt.phys_mode == 'learned':
+        LP = LearnedPhysics(opt.gb_sigma, opt.phys_ch, *opt.phys_w).to(device)
     vgg = PerceptionLoss().to(device)
     mse = nn.MSELoss()
-    optG = optim.Adam(list(G.parameters()) + list(P.parameters()), lr=opt.lr, betas=(0.9, 0.999), eps=1e-8)
+    g_params = list(G.parameters()) + list(P.parameters()) + (list(LP.parameters()) if LP else [])
+    optG = optim.Adam(g_params, lr=opt.lr, betas=(0.9, 0.999), eps=1e-8)
     optD = optim.Adam(D.parameters(), lr=opt.lr, betas=(0.5, 0.999))
 
     last = os.path.join(opt.save_folder, 'last.pth')
@@ -142,6 +154,8 @@ if __name__ == '__main__':
     if os.path.exists(last):
         ck = torch.load(last, map_location=device)
         G.load_state_dict(ck['G']); D.load_state_dict(ck['D']); P.load_state_dict(ck['P'])
+        if LP:
+            LP.load_state_dict(ck['LP'])
         optG.load_state_dict(ck['optG']); optD.load_state_dict(ck['optD'])
         start = ck['iter'] + 1
         print('===> Resumed from iteration {}'.format(ck['iter']))
@@ -152,9 +166,12 @@ if __name__ == '__main__':
                 if not n.startswith(('decoder.po_', 'decoder.compute_z_po', 'decoder.colornet')))
     print('generator params at inference: {:.3f}M | discriminator {:.2f}M (training only)'.format(
         n_inf / 1e6, sum(p.numel() for p in D.parameters()) / 1e6))
+    if LP:
+        print('learned physics networks: {:.2f}M (training only)'.format(sum(p.numel() for p in LP.parameters()) / 1e6))
 
     log_path = os.path.join(opt.save_folder, 'loss_log.csv')
-    fields = ['iter', 'total', 'L_e', 'w_e', 'L_m', 'L_s', 'adv', 'D', 'phys', 'sec_per_it']
+    fields = ['iter', 'total', 'L_e', 'w_e', 'L_m', 'L_s', 'adv', 'D', 'phys',
+              'phys_enh', 'phys_deg', 'phys_t', 'phys_B', 'sec_per_it']
     new_log = not os.path.exists(log_path)
     log_f = open(log_path, 'a', newline='')
     log_w = csv.DictWriter(log_f, fieldnames=fields, restval='')
@@ -197,10 +214,14 @@ if __name__ == '__main__':
             L_adv = lsgan_g_loss(D(out))
             loss = loss + ramp * opt.lam_adv * L_adv
             terms['adv'] = L_adv.item()
-        if opt.lam_phys > 0:
+        if opt.lam_phys > 0 and LP:
+            L_phys, parts = LP(out, inp)
+            terms.update({'phys_' + k: v.item() for k, v in parts.items()})
+        elif opt.lam_phys > 0:
             with torch.no_grad():
                 t, B_inf = underwater_dcp(inp)
             L_phys, _ = P(out, inp, t, B_inf)
+        if opt.lam_phys > 0:
             loss = loss + opt.lam_phys * L_phys
             terms['phys'] = L_phys.item()
         terms['total'] = loss.item()
@@ -223,7 +244,7 @@ if __name__ == '__main__':
 
         if it % opt.save_every == 0 or it == opt.iters:
             save(last, G=G.state_dict(), D=D.state_dict(), P=P.state_dict(), optG=optG.state_dict(),
-                 optD=optD.state_dict(), iter=it, args=vars(opt))
+                 optD=optD.state_dict(), iter=it, args=vars(opt), LP=LP.state_dict() if LP else None)
         if opt.keep_every and it % opt.keep_every == 0 and it < opt.iters:
             # small generator-only snapshots, to check afterwards whether fewer iterations would do
             save(os.path.join(opt.save_folder, 'iter_{}.pth'.format(it)), G=G.state_dict(), iter=it, args=vars(opt))
