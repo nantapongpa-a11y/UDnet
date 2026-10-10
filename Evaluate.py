@@ -15,7 +15,6 @@ parser = argparse.ArgumentParser(description='Evaluate enhanced underwater image
 parser.add_argument('--pred_dir', type=str, required=True, help='folder of enhanced images (e.g. Inference.py output)')
 parser.add_argument('--gt_dir', type=str, default='', help='folder of reference images; enables PSNR/SSIM/GMSD')
 parser.add_argument('--nr_size', type=int, default=0, help='if >0, resize to nr_size x nr_size before UIQM/UCIQE')
-parser.add_argument('--uciqe_centered', type=str2bool, default=False, help='centre Lab a/b at 128 in UCIQE')
 parser.add_argument('--pyiqa', type=str2bool, default=False, help='also compute NIQE and MUSIQ (needs pip install pyiqa)')
 parser.add_argument('--csv', type=str, default='', help='optional path to save per-image scores')
 
@@ -82,7 +81,10 @@ if __name__ == '__main__':
 
         nr = cv2.resize(pred, (opt.nr_size, opt.nr_size), interpolation=cv2.INTER_CUBIC) if opt.nr_size > 0 else pred
         row['UIQM'] = uiqm(nr)
-        row['UCIQE'] = uciqe(nr, centered_ab=opt.uciqe_centered)
+        # UCIQE: common Python port (comparable to papers) and the a/b-centred fix,
+        # which stays in range on dark images where the common port blows up
+        row['UCIQE'] = uciqe(nr)
+        row['UCIQEc'] = uciqe(nr, centered_ab=True)
         if iqa:
             row.update(iqa(pred))
 
@@ -93,7 +95,7 @@ if __name__ == '__main__':
         print('===> {} predictions resized to GT size for full-reference metrics'.format(resized))
 
     keys = [k for k in rows[0] if k != 'name']
-    better = {'PSNR': '+', 'SSIM': '+', 'GMSD': '-', 'UIQM': '+', 'UCIQE': '+', 'NIQE': '-', 'MUSIQ': '+'}
+    better = {'PSNR': '+', 'SSIM': '+', 'GMSD': '-', 'UIQM': '+', 'UCIQE': '+', 'UCIQEc': '+', 'NIQE': '-', 'MUSIQ': '+'}
     print('\n===> Mean over {} images  (+ higher is better, - lower is better)'.format(len(rows)))
     for k in keys:
         vals = np.array([r[k] for r in rows], dtype=np.float64)

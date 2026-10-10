@@ -228,12 +228,13 @@ def summarize(work):
     runs = os.path.join(work, "runs")
     if os.path.isdir(runs):
         rows += [(r, os.path.join(runs, r, "metrics_test.csv")) for r in sorted(os.listdir(runs))]
-    keys = ["PSNR", "SSIM", "GMSD", "UIQM", "UCIQE"]
+    keys = ["PSNR", "SSIM", "GMSD", "UIQM", "UCIQE", "UCIQEc"]
     print("{:<64s}".format("method / run") + "".join("{:>9s}".format(k) for k in keys) + "    n")
     for name, path in rows:
         if not os.path.exists(path):
             continue
         data = list(csv.DictReader(open(path)))
-        vals = ["{:>9.4f}".format(np.mean([float(d[k]) for d in data])) if k in data[0] else "{:>9s}".format("-")
+        d0 = data[0] if data else {}
+        vals = ["{:>9.4f}".format(np.mean([float(d[k]) for d in data])) if d0.get(k) else "{:>9s}".format("-")
                 for k in keys]
         print("{:<64s}".format(name[:64]) + "".join(vals) + "  {:>3d}".format(len(data)))
