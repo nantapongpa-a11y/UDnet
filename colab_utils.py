@@ -193,12 +193,15 @@ def build_clean_dir(euvp_dir, data_dir, n, seed):
 # ----------------------------------------------------------------------------
 # Running scripts
 # ----------------------------------------------------------------------------
-def run(args):
+def run(args, quiet=False):
     """Run a repo script with the current Python; print the tail; raise on failure."""
-    print("$", " ".join(args))
+    if not quiet:
+        print("$", " ".join(args))
     r = subprocess.run([sys.executable] + args, capture_output=True, text=True)
-    print(r.stdout[-6000:])
+    if not quiet:
+        print(r.stdout[-6000:])
     if r.returncode:
+        print(r.stdout[-3000:])
         print(r.stderr[-3000:])
         raise RuntimeError("{} failed (exit {})".format(args[0], r.returncode))
 
@@ -219,6 +222,26 @@ def run_logged(args, log_path, show=("Complete", "Checkpoint", "Iter ", "Loading
     if p.returncode:
         print("".join(tail))
         raise RuntimeError("{} failed (exit {}) -- full log: {}".format(args[0], p.returncode, log_path))
+
+
+def mean_metrics(csv_path, keys=("PSNR", "SSIM", "UIQM", "UCIQEc")):
+    data = list(csv.DictReader(open(csv_path)))
+    return {k: float(np.mean([float(d[k]) for d in data])) for k in keys if data and data[0].get(k)}
+
+
+def convergence(snapshots, infer, pred_root, gt_dir, out_dir):
+    """Score each (iterations, checkpoint) on the test set, to see where training stops improving.
+
+    infer(ckpt, out_folder) must write the enhanced test images into out_folder.
+    """
+    print("{:>12s}".format("iterations") + "".join("{:>9s}".format(k) for k in ("PSNR", "SSIM", "UIQM", "UCIQEc")))
+    for its, ckpt in snapshots:
+        pred = os.path.join(pred_root, "it{}".format(its))
+        infer(ckpt, pred)
+        out = os.path.join(out_dir, "metrics_it{}.csv".format(its))
+        run(["Evaluate.py", "--pred_dir", pred, "--gt_dir", gt_dir, "--csv", out], quiet=True)
+        m = mean_metrics(out)
+        print("{:>12,d}".format(its) + "".join("{:>9.4f}".format(m[k]) for k in ("PSNR", "SSIM", "UIQM", "UCIQEc")))
 
 
 def summarize(work):

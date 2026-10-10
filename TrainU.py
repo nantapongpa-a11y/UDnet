@@ -58,6 +58,7 @@ parser.add_argument('--le_anneal', type=int, default=0, help='stage 2: iteration
 parser.add_argument('--init', type=str, default='', help='start the generator from a Train.py/author checkpoint')
 parser.add_argument('--save_folder', default='weights_u/')
 parser.add_argument('--save_every', type=int, default=500)
+parser.add_argument('--keep_every', type=int, default=10000, help='also keep a generator snapshot every N iterations (0 = off)')
 parser.add_argument('--log_every', type=int, default=100)
 
 
@@ -223,6 +224,9 @@ if __name__ == '__main__':
         if it % opt.save_every == 0 or it == opt.iters:
             save(last, G=G.state_dict(), D=D.state_dict(), P=P.state_dict(), optG=optG.state_dict(),
                  optD=optD.state_dict(), iter=it, args=vars(opt))
+        if opt.keep_every and it % opt.keep_every == 0 and it < opt.iters:
+            # small generator-only snapshots, to check afterwards whether fewer iterations would do
+            save(os.path.join(opt.save_folder, 'iter_{}.pth'.format(it)), G=G.state_dict(), iter=it, args=vars(opt))
     log_f.close()
 
     save(os.path.join(opt.save_folder, 'final.pth'), G=G.state_dict(), iter=opt.iters, args=vars(opt))
